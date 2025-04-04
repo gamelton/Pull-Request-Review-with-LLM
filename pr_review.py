@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 
 # LLM review Pull Request
+#
+# Requirements:
+# - OLLAMA server + model
+# - BitBucket token with permissions
+#   Manage account / HTTP access tokens
+# - Jira token
+#   Profile / Personal Access Tokens
+# - Cron job that runs this script
+#   /etc/cron.d/pr_review:
+#   MAILTO=info@example.com
+#   0 */2 * * * root /opt/pr_review.py
 
 import requests
 import re
@@ -9,6 +20,7 @@ from datetime import datetime, timedelta
 # Constants
 BITBUCKET_API_TOKEN = "<your-bitbucket-token>"
 BITBUCKET_ALL_PR_URL = "https://bitbucket.example.com/rest/api/latest/projects/<project name>/repos/<repository>/pull-requests"
+JIRA_API_TOKEN = "<your-Jira-token>"
 OLLAMA_URL = "http://ollama.example.com:11434/api/chat"
 
 ## All PR
@@ -16,35 +28,65 @@ response = requests.get(BITBUCKET_ALL_PR_URL, headers={"Authorization": f"Bearer
 response.raise_for_status()
 
 now = datetime.now()
-two_hours_ago = now - timedelta(hours=2)
+TWO_HOURS_AGO = now - timedelta(hours=2)
 
-recent_pr_ids = []
+RECENT_PRS = []
 if response and response.json()["values"]:
-    recent_pr_ids = [pr["id"] for pr in response.json()["values"] if datetime.fromtimestamp(pr["createdDate"] / 1000) > two_hours_ago]
+    RECENT_PRS = [{"id": pr["id"], "title": pr["title"]} for pr in response.json()["values"] if datetime.fromtimestamp(pr["createdDate"] / 1000) > TWO_HOURS_AGO]
     
     # PR diff
     for pr in recent_pr_ids:
-        BITBUCKET_PR_ID = pr
+        BITBUCKET_PR_ID = pr["id"]
+        BITBUCKET_PR_TITLE = pr["title"]
         BITBUCKET_PR_DIFF_URL = f"https://bitbucket.example.com/rest/api/latest/projects/<project name>/repos/<repository>/pull-requests/{BITBUCKET_PR_ID}.diff"
         response = None
-        response = requests.get(BITBUCKET_PR_DIFF_URL, headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"})
+        response = requests.get(BITBUCKET_PR_DIFF_URL, headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"}, params={"contextLines": 20})
         response.raise_for_status()
-        git_diff = response.text
+        GIT_DIFF = response.text
         
         # LLM review of the diff
-        llm_request = f"Given the following git diff of an Ansible pull request, identify and list any issues found: Broken Code, Syntax Errors, Duplicate Code, Null Variables, Unused Code, Mutable Existence, Code Optimization, Confusing Code.  \nReview and provide a list of any issues found, being clear, simple, and concise in your assessment. List only detected issues. Provide brief descriptions and locations where each issue occurs.  \n{git_diff}"
+        LLM_REQUEST = f"Given the following git diff of an Ansible pull request, identify and list any issues found: Syntax Errors, Incompatibilities, Variable Naming and Scoping, Confusing Code, Unused Code.  \nEnsure the pull request fully addresses the Jira issue by including all necessary changes without omitting or adding unnecessary parts.  \nNote that the git change is a snippet, which may not include the entire file.  \nReview and provide a list of any issues found, being clear, simple, and concise in your assessment. List only detected issues. Provide brief descriptions and locations where each issue occurs.  \n{GIT_DIFF}"
         
-        data = {"model": "deepseek-r1:14b", "stream": False, "messages": [{ "role": "user", "content": f"{llm_request}" }], "options": { "num_ctx": 8192 }}
+        # Find associated Jira issue
+        try:
+            ADMIN_PATTERN = r'\bADMIN-\d+\b'
+            JIRA_ISSUE_ID = None
+            JIRA_ISSUE_ID = (match.group(0) if (match := re.search(ADMIN_PATTERN, BITBUCKET_PR_TITLE)) else None)
+            if JIRA_ISSUE_ID:
+                JIRA_ISSUE_URL = f"https://jira.example.com/rest/api/latest/issue/{JIRA_ISSUE_ID}"
+                response = None
+                response = requests.get(JIRA_ISSUE_URL, headers={"Authorization": f"Bearer {JIRA_API_TOKEN}", "Accept": "application/json;charset=UTF-8"})
+                response.raise_for_status()
+                if response and response.json()['fields']['summary']:
+                    ISSUE_NAME = response.json()['fields']['summary']
+                    ISSUE_DESCRIPTION = response.json()['fields']['description']
+                    ISSUE_SUMMARY = None
+                    ISSUE_SUMMARY = f"{ISSUE_NAME} {ISSUE_DESCRIPTION}"
+        except:
+            pass
+        
+        if ISSUE_SUMMARY:
+            PREFIX_JIRA = f"The following is a Jira issue: {ISSUE_SUMMARY}.\n  End of Jira issue.  \n"
+            LLM_REQUEST = PREFIX_JIRA + LLM_REQUEST
+        
+        data = {"model": "deepseek-r1:14b", "stream": False, "messages": [{ "role": "user", "content": f"{LLM_REQUEST}" }], "options": { "num_ctx": 8192 }}
         
         response = None
         response = requests.post(OLLAMA_URL, json=data, headers={"Content-Type": "application/json"})
         response.raise_for_status()
         if response and response.json()["message"]["content"]:
-            llm_review_raw = response.json()["message"]["content"]
-            llm_review = re.sub(r"<think>.*?</think>\n?", "", llm_review_raw, flags=re.DOTALL) 
+            LLM_REVIEW_RAW = response.json()["message"]["content"]
+            LLM_REVIEW = re.sub(r"<think>.*?</think>\n?", "", LLM_REVIEW_RAW, flags=re.DOTALL)
             
             # PR comment
             BITBUCKET_PR_COMMENTS_URL = f"https://bitbucket.example.com/rest/api/latest/projects/<project name>/repos/<repository>/pull-requests/{BITBUCKET_PR_ID}/comments"
-            data = {"text": f"Please note that this comment is generated by an AI model and may not be fully accurate or reliable.  \n{llm_review}"}
+            data = {"text": f"Please note that this comment is generated by an AI model and may not be fully accurate or reliable.  \n{LLM_REVIEW}"}
             response = requests.request("POST", BITBUCKET_PR_COMMENTS_URL, json=data, headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}", "Accept": "application/json;charset=UTF-8", "Content-Type": "application/json"})
             response.raise_for_status()
+
+# References:
+# Time to run: 
+# - deepseek:14b(9Gb): 8CPU,26GBRAM: 8min
+# Cron script runs every 2 hours. Review opened Pull Request of the last 2 hours.
+# https://docs.atlassian.com/bitbucket-server/rest/5.16.0/bitbucket-rest.html#idm8297336928
+# https://ollama.com/library/deepseek-r1:14b
