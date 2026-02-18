@@ -10,15 +10,31 @@
 #   /etc/cron.d/pr_review:
 #   MAILTO=it-info@example.com
 #   0 */2 * * * root /opt/pr_review.py
+# - Logging rotate:
+#   /etc/logrotate.d/pr_review
+#     /var/log/pr_review.log {
+#         weekly
+#         rotate 4
+#         compress
+#         missingok
+#         notifempty
+#     }
 
 import requests
 import re
 import sys
 import textwrap
 from datetime import datetime, timedelta
+import logging
 
 BITBUCKET_API_TOKEN = "bitbucket-token"
 JIRA_API_TOKEN = "jira-token"
+
+logging.basicConfig(
+    filename="/var/log/pr_review.log",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 ## All PR
 try:
@@ -27,15 +43,22 @@ try:
     page = response.json()
     values = page.get("values") or []
     if not values:
+        logging.info(f"PR: No open pull requests.")
         print(f"No open pull requests.")
         sys.exit()
 except BaseException as error:
+    logging.error(f"PR: Get pull requests ERROR: {error}")
     print(f'Get pull requests ERROR: {error}', file=sys.stderr)
     sys.exit(1)
 
 TWO_HOURS_AGO = datetime.now() - timedelta(hours=2)
 RECENT_PRS = []
-RECENT_PRS = [{"id": pr["id"], "title": pr["title"]} for pr in response.json()["values"] if datetime.fromtimestamp(pr["createdDate"] / 1000) > TWO_HOURS_AGO]
+RECENT_PRS = [
+    {"id": pr["id"], "title": pr["title"], "description": pr.get("description", ""),
+     "toRef": pr.get("toRef")}
+    for pr in response.json()["values"]
+    if datetime.fromtimestamp(pr["createdDate"] / 1000) > TWO_HOURS_AGO
+]
 
 # PR diff
 for pr in RECENT_PRS:
@@ -48,6 +71,26 @@ for pr in RECENT_PRS:
     ISSUE_SUMMARY = None
     # PR target (base) ref – use this to read the "original" files
     BASE_REF = ((pr.get("toRef") or {}).get("id")) or ""
+    
+    # Before posting, check for existing bot comment
+    try:
+        existing = requests.get(
+            f"https://stash.in.example.com/rest/api/latest/projects/IT/repos/ansible/pull-requests/{BITBUCKET_PR_ID}/activities",
+            headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"},
+            params={"limit": 200}, timeout=20,
+        )
+        existing.raise_for_status()
+        already_reviewed = any(
+            "AI-generated review" in (a.get("comment", {}).get("text", ""))
+            for a in existing.json().get("values", [])
+            if a.get("action") == "COMMENTED"
+        )
+        if already_reviewed:
+            logging.info(f"PR {BITBUCKET_PR_ID}: already reviewed, skipping")
+            continue
+    except Exception as e:
+        logging.warning(f"PR {BITBUCKET_PR_ID}: could not check existing comments: {e}")
+        continue
     if not BASE_REF:
         try:
             d = requests.get(f"https://stash.in.example.com/rest/api/latest/projects/IT/repos/ansible/pull-requests/{BITBUCKET_PR_ID}", headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"}, timeout=20,)
@@ -56,6 +99,7 @@ for pr in RECENT_PRS:
             if not BASE_REF:
                 continue
         except BaseException as error:
+            logging.error(f"PR {BITBUCKET_PR_ID}: Get pull request ref ERROR: {error}")
             print(f'Get pull request ref ERROR: {error}', file=sys.stderr)
             continue
     
@@ -67,6 +111,7 @@ for pr in RECENT_PRS:
         if not GIT_DIFF.strip():
             continue
     except BaseException as error:
+        logging.error(f"PR {BITBUCKET_PR_ID}: Get PR git diff ERROR: {error}")
         print(f'Get PR git diff ERROR: {error}', file=sys.stderr)
         continue
     
@@ -89,6 +134,7 @@ for pr in RECENT_PRS:
                     resp = requests.get(f"https://jira.in.example.com/rest/api/latest/issue/{key}", headers={"Authorization": f"Bearer {JIRA_API_TOKEN}"}, timeout=20,)
                     resp.raise_for_status()
                 except BaseException as error:
+                    logging.error(f"PR {BITBUCKET_PR_ID}: Get Jira issue ERROR: {error}")
                     print(f'Get Jira issue ERROR: {error}', file=sys.stderr)
                     continue
                 
@@ -113,8 +159,7 @@ for pr in RECENT_PRS:
     except Exception:
         jira_issues = []
     
-    # Environment/policy block here (before Jira context)
-    PREFIX_LIMITATIONS = textwrap.dedent("""
+    PREFIX_LIMITATIONS = textwrap.dedent(r"""
     ENVIRONMENT FACTS (treat as hard constraints)
     - This repo configures internal Linux hosts managed by sysadmins (manual runs) and AWX (scheduled templates).
     - Supported OS: the latest 3 supported LTS/stable releases of Ubuntu, Debian, AlmaLinux, Oracle Linux (systemd everywhere).
@@ -123,8 +168,6 @@ for pr in RECENT_PRS:
       community.zabbix, community.crypto, community.mysql, community.general, community.postgresql,
       community.docker, community.proxmox, ansible.posix, awx.awx, plus ansible.builtin.
     - Hosts generally have Internet access:
-      - OS packages must come via mirror.in.example.com (apt/yum/dnf proxy/mirror).
-      - Artifacts/binaries must come from nexus.in.example.com.
       - Any external URL usage is suspicious and should be flagged unless explicitly justified in Jira.
     - Typical execution:
       - CLI: ansible-playbook playbook.yml -l <host_or_group> (partial rollout is common).
@@ -144,12 +187,15 @@ for pr in RECENT_PRS:
     - Restarts/reloads must be handler-based; avoid unconditional restarts (especially for sshd, sudo, network, proxy, DBs).
     - Multi-distro correctness: package/service names, paths, and repo config must be conditional on facts
       (ansible_facts['os_family'], distribution, major version).
-    - Package sources: apt/yum repo configuration must point to mirror.in.example.com (not public repos).
-    - Artifacts: get_url/unarchive/docker_image/etc must use nexus.in.example.com when pulling binaries/images.
     - Secrets must not be logged (use no_log where needed).
     - AWX safety: no interactive prompts; pause only if explicitly required by Jira and guarded.
+    - HTTP fetches (get_url, uri, etc.): must include retries and validate that the response body is non-empty; 
+      never assume HTTP 200 guarantees valid content.
+    - Template validation: configuration files for critical services (nginx, sshd, sudoers, bind) 
+      must be validated before deployment (e.g., nginx -t, visudo -c, named-checkzone).
     """).strip() + "\n\n\n"
     
+    # print(f"DEBUG: Got Jira issue keys: {[k for k, *_ in jira_issues]}")
     # Build Jira context prefix
     if jira_issues:
         lines = ["Jira context for requirements:"]
@@ -158,20 +204,24 @@ for pr in RECENT_PRS:
             lines += [f"{'Primary' if i == 0 else 'Related'}: {k}", f"Summary: {s}", f"Description: {dsc}", ""]
         PREFIX_JIRA = "\n".join(lines).strip() + "\n\n"
         PREFIX_COMBINED = PREFIX_LIMITATIONS + PREFIX_JIRA
+    else:
+        PREFIX_COMBINED = PREFIX_LIMITATIONS
     
     # LLM review of the diff
-    LLM_REQUEST = textwrap.dedent("""
+    LLM_REQUEST = textwrap.dedent(r"""
     Review this Ansible pull request.
     
-    Given ORIGINAL FILE (from target branch) + UNIFIED DIFF (PR changes), list ONLY detected issues:
-    - syntax/errors
-    - incompatibilities
-    - unused/unknown vars or waste code
-    - changes that do NOT match Jira requirements, or missing required changes
+    Given ORIGINAL FILE (from target branch) + UNIFIED DIFF (PR changes):
     
-    Output format:
-    - If none: "No issues found."
-    - Else: bullets with title, short description, and location (file + approx line/snippet).
+    1. **Summary**: One paragraph — what this PR changes and which hosts/roles/services are affected.
+    2. **Verdict**: One of: ✅ LGTM, ⚠️ Minor issues, ❌ Blocking issues.
+    3. **Issues** (only if any):
+       - Category (syntax | idempotency | safety | multi-distro | secrets | convention | Jira mismatch)
+       - File and approximate line
+       - Short description and suggested fix
+    4. **Suggested test command**: an `ansible-playbook ... --check --diff -l ...` one-liner the author can run to validate.
+    
+    If no issues: output Summary, "✅ LGTM — no issues found.", and the test command.
     """).strip() + "\n\n\n"
     
     parts = [PREFIX_COMBINED + LLM_REQUEST]
@@ -208,8 +258,26 @@ for pr in RECENT_PRS:
         if len(orig) > 12000:
             orig = orig[:6000] + "\n...[truncated]...\n" + orig[-6000:]
         blk = block if len(block) <= 12000 else (block[:6000] + "\n...[truncated]...\n" + block[-6000:])
+        
+        # Classify the changed file for the LLM
+        file_class = "unknown"
+        if display_path.startswith("host_vars/"):
+            parts_split = display_path.split("/")
+            host = parts_split[1] if len(parts_split) > 1 else "?"
+            file_class = f"host-specific variables (affects only host: {host})"
+        elif display_path.startswith("group_vars/"):
+            parts_split = display_path.split("/")
+            group = parts_split[1] if len(parts_split) > 1 else "?"
+            file_class = f"group variables (affects group: {group})"
+        elif display_path.startswith("roles/"):
+            file_class = "role file (affects all hosts using this role)"
+        elif display_path.endswith((".yml", ".yaml")) and "/" not in display_path:
+            file_class = "top-level playbook"
+        else:
+            file_class = "other"
+        
         parts.append(
-            f"=== FILE: {display_path} ===\n"
+            f"=== FILE: {display_path} [{file_class}] ===\n"
             f"[ORIGINAL FILE @ {BASE_REF} | path={orig_path or '(new file)'}]\n{orig}\n\n"
             f"[UNIFIED DIFF]\n{blk}\n"
         )
@@ -230,7 +298,7 @@ for pr in RECENT_PRS:
                 found_any = False
                 collected = 0
                 while True:
-                    br = requests.get(                        f"https://stash.in.example.com/rest/api/latest/projects/IT/repos/ansible/browse/{dir_path}", headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"}, params={"at": BASE_REF, "limit": 200, "start": start}, timeout=20,)
+                    br = requests.get(f"https://stash.in.example.com/rest/api/latest/projects/IT/repos/ansible/browse/{dir_path}", headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}"}, params={"at": BASE_REF, "limit": 200, "start": start}, timeout=20,)
                     if br.status_code != 200:
                         break
                     
@@ -282,20 +350,23 @@ for pr in RECENT_PRS:
     LLM_REQUEST = "\n\n".join(parts)
     if len(LLM_REQUEST) > 180000:
         LLM_REQUEST = LLM_REQUEST[:180000] + "\n...[hard truncated to fit context]...\n"
-    data = {"model": "deepseek-r1:14b", "stream": False, "messages": [{ "role": "user", "content": f"{LLM_REQUEST}" }], "options": { "num_ctx": 20480 }}
+    data = {"model": "glm-4.7-flash:q4_K_M", "stream": False, "messages": [{ "role": "user", "content": f"{LLM_REQUEST}" }], "options": { "num_ctx": 46080 }}
     try:
-        response = requests.post("http://ollama-test.example.com:11434/api/chat", json=data, headers={"Content-Type": "application/json"})
+        response = requests.post("http://ollama-test.example.ru:11434/api/chat", json=data, headers={"Content-Type": "application/json"})
         response.raise_for_status()
         content = (((response.json() or {}).get("message") or {}).get("content") or "").strip()
     except BaseException as error:
+        logging.error(f"PR {BITBUCKET_PR_ID}: Get LLM response ERROR: {error}")
         print(f'Get LLM response ERROR: {error}', file=sys.stderr)
         continue
     
     if not content:
+        logging.warning(f"PR {BITBUCKET_PR_ID}: LLM returned empty content")
         continue
     content = re.sub(r"<think>.*?</think>\n?", "", content, flags=re.DOTALL).strip()
     # optional: avoid noise if no issues
     if content.strip() == "No issues found.":
+        logging.info(f"PR {BITBUCKET_PR_ID}: No issues found, skipping comment")
         continue
     comment = f"AI-generated review (may be incorrect):\n\n{content}"
     if len(comment) > 30000:
@@ -305,6 +376,7 @@ for pr in RECENT_PRS:
         response = requests.post(f"https://stash.in.example.com/rest/api/latest/projects/IT/repos/ansible/pull-requests/{BITBUCKET_PR_ID}/comments", json={"text": comment}, headers={"Authorization": f"Bearer {BITBUCKET_API_TOKEN}", "Accept": "application/json;charset=UTF-8", "Content-Type": "application/json"})
         response.raise_for_status()
     except BaseException as error:
+        logging.error(f"PR {BITBUCKET_PR_ID}: Post BitBucket comment ERROR: {error}")
         print(f'Post BitBucket comment ERROR: {error}', file=sys.stderr)
         continue
 
@@ -312,7 +384,7 @@ for pr in RECENT_PRS:
 # References:
 # Time to run: 
 # - deepseek-r1:14b(9Gb): 8CPU,26GBRAM: 8min per PR
-# - gemma3:12b(8Gb): 8CPU,36GBRAM: too long
+# - gemma3:12b(8Gb): 8CPU,36GBRAM: 
 # Cron script runs every 2 hours. Review opened Pull Request of the last 2 hours.
 # https://docs.atlassian.com/bitbucket-server/rest/5.16.0/bitbucket-rest.html#idm8297336928
 # https://docs.atlassian.com/software/jira/docs/api/REST/9.10.0/
